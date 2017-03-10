@@ -40,6 +40,10 @@
 #include "StagefrightMetadataRetriever.h"
 #include "MediaPlayerFactory.h"
 
+#ifdef USE_FFPLAYER
+#include "RkMetadataRetriever.h"
+#endif
+
 namespace android {
 
 MetadataRetrieverClient::MetadataRetrieverClient(pid_t pid)
@@ -84,7 +88,9 @@ static sp<MediaMetadataRetrieverBase> createRetriever(player_type playerType)
 {
     sp<MediaMetadataRetrieverBase> p;
     switch (playerType) {
+        case APE_PLAYER:
         case STAGEFRIGHT_PLAYER:
+        case FF_PLAYER:
         case NU_PLAYER:
         {
             p = new StagefrightMetadataRetriever;
@@ -94,6 +100,14 @@ static sp<MediaMetadataRetrieverBase> createRetriever(player_type playerType)
             ALOGV("create midi metadata retriever");
             p = new MidiMetadataRetriever();
             break;
+
+#if 0
+        case FF_PLAYER:
+        {
+            p =  new RK_MetadataRetriever;
+            break;
+        }
+#endif
         default:
             // TODO:
             // support for TEST_PLAYER

@@ -96,6 +96,7 @@ private:
         kWhatStopWidevine,
         kWhatStart,
         kWhatResume,
+        kWhatSecureDecodersInstantiated,
     };
 
     struct Track {
@@ -148,6 +149,7 @@ private:
     bool mBuffering;
     bool mPrepareBuffering;
     mutable Mutex mReadBufferLock;
+    mutable Mutex mDisconnectLock;
 
     sp<ALooper> mLooper;
 
@@ -161,6 +163,9 @@ private:
     status_t prefillCacheIfNecessary();
 
     void notifyPreparedAndCleanup(status_t err);
+    void onSecureDecodersInstantiated(status_t err);
+    void finishPrepareAsync();
+    status_t startSources();
 
     void onGetFormatMeta(sp<AMessage> msg) const;
     sp<MetaData> doGetFormatMeta(bool audio) const;

@@ -200,7 +200,7 @@ protected:
             STRATEGY_SONIFICATION_RESPECTFUL,
             STRATEGY_DTMF,
             STRATEGY_ENFORCED_AUDIBLE,
-            STRATEGY_TRANSMITTED_THROUGH_SPEAKER,
+			STRATEGY_TRANSMITTED_THROUGH_SPEAKER,
             STRATEGY_ACCESSIBILITY,
             STRATEGY_REROUTING,
             NUM_STRATEGIES
@@ -828,6 +828,10 @@ protected:
         KeyedVector<int, sp<EffectDescriptor> > mEffects;  // list of registered audio effects
         bool    mA2dpSuspended;  // true if A2DP output is suspended
         sp<DeviceDescriptor> mDefaultOutputDevice; // output device selected by default at boot time
+#ifdef BOX_STRATEGY
+        sp<DeviceDescriptor> mHDMIOutputDevice;
+        sp<DeviceDescriptor> mSPDIFOutputDevice;
+#endif
         bool mSpeakerDrcEnabled;// true on devices that use DRC on the DEVICE_CATEGORY_SPEAKER path
                                 // to boost soft sounds, used to adjust volume curves accordingly
 
@@ -879,12 +883,12 @@ protected:
         uint32_t        mTestChannels;
         uint32_t        mTestLatencyMs;
 #endif //AUDIO_POLICY_TEST
+private:
         static float volIndexToAmpl(audio_devices_t device, const StreamDescriptor& streamDesc,
                 int indexInUi);
         static bool isVirtualInputDevice(audio_devices_t device);
         uint32_t nextUniqueId();
         uint32_t nextAudioPortGeneration();
-private:
         // updates device caching and output for streams that can influence the
         //    routing of notifications
         void handleNotificationRoutingForStream(audio_stream_type_t stream);

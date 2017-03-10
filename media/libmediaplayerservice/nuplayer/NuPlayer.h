@@ -185,6 +185,15 @@ private:
     // still become true, when we pause internally due to buffering.
     bool mPausedByClient;
 
+    // --------------
+    // add by lance 2014.06.20
+    int32_t    wifidisplay_flag;
+    int32_t *wifidisplay_info;
+    int64_t start_time ;
+    int64_t audio_start_time;
+    // --------------
+
+
     inline const sp<DecoderBase> &getDecoder(bool audio) {
         return audio ? mAudioDecoder : mVideoDecoder;
     }
@@ -200,6 +209,8 @@ private:
     void closeAudioSink();
 
     status_t instantiateDecoder(bool audio, sp<DecoderBase> *decoder);
+
+    status_t onInstantiateSecureDecoders();
 
     void updateVideoSize(
             const sp<AMessage> &inputFormat,

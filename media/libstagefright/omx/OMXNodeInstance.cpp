@@ -182,6 +182,7 @@ OMXNodeInstance::OMXNodeInstance(
     mNumPortBuffers[1] = 0;
     mDebugLevelBumpPendingBuffers[0] = 0;
     mDebugLevelBumpPendingBuffers[1] = 0;
+    mIsSecure = AString(name).endsWith(".secure");
 }
 
 OMXNodeInstance::~OMXNodeInstance() {
@@ -376,6 +377,7 @@ status_t OMXNodeInstance::getParameter(
     Mutex::Autolock autoLock(mLock);
 
     OMX_ERRORTYPE err = OMX_GetParameter(mHandle, index, params);
+
     OMX_INDEXEXTTYPE extIndex = (OMX_INDEXEXTTYPE)index;
     // some errors are expected for getParameter
     if (err != OMX_ErrorNoMore) {

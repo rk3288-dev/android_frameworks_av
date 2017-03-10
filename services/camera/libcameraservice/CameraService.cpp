@@ -93,6 +93,7 @@ static void camera_device_status_change(
 // This is ugly and only safe if we never re-create the CameraService, but
 // should be ok for now.
 static CameraService *gCameraService;
+static bool mSystemUiFlashConnected = false;
 
 CameraService::CameraService()
     :mSoundRef(0), mModule(0)
@@ -112,7 +113,7 @@ void CameraService::onFirstRef()
     LOG1("CameraService::onFirstRef");
 
     BnCameraService::onFirstRef();
-
+	
     if (hw_get_module(CAMERA_HARDWARE_MODULE_ID,
                 (const hw_module_t **)&mModule) < 0) {
         ALOGE("Could not load camera HAL module");
@@ -221,6 +222,11 @@ void CameraService::onDeviceStatusChanged(int cameraId,
 }
 
 int32_t CameraService::getNumberOfCameras() {
+    if(mNumberOfCameras == 0) {
+       ALOGE("no camera found before! check again...");
+       onFirstRef();
+    }
+
     return mNumberOfCameras;
 }
 
@@ -629,15 +635,10 @@ bool CameraService::canConnectUnsafe(int cameraId,
                 LOG1("CameraService::connect X (pid %d) (the same client)",
                      callingPid);
                 return true;
-            } else {
-                // TODOSC: need to support 1 regular client,
-                // multiple shared clients here
-                ALOGW("CameraService::connect X (pid %d) rejected"
-                      " (existing client).", callingPid);
-                return false;
             }
+        }else {
+        	mClient[cameraId].clear();
         }
-        mClient[cameraId].clear();
     }
 
     /*
@@ -649,13 +650,35 @@ bool CameraService::canConnectUnsafe(int cameraId,
     multiple Clents to be opened concurrently, but multiple BasicClient
     would be fine
     */
-    if (mBusy[cameraId]) {
-        ALOGW("CameraService::connect X (pid %d, \"%s\") rejected"
-                " (camera %d is still busy).", callingPid,
-                clientName8.string(), cameraId);
-        return false;
-    }
 
+	for (int i = 0; i < mNumberOfCameras; i++) {
+	    if (mBusy[i]) {
+			if(mSystemUiFlashConnected) {
+				Vector<sp<ICameraServiceListener> >::const_iterator it;
+				for (it = mListenerList.begin(); it != mListenerList.end(); ++it) {
+					ALOGV("onStatusChanged in++++");
+					(*it)->onStatusChanged((ICameraServiceListener::Status)0x80000001, 0);
+				}
+
+				
+				ALOGD("mFlashCondition wait....");
+				mFlashLock.lock();		
+				mFlashCondition.wait(mServiceLock);
+				mFlashLock.unlock();
+				mServiceLock.unlock();
+				
+				ALOGD("updateStatus out.");
+				
+				return true;
+			}
+	    }
+	}
+	if(mBusy[cameraId]) {
+		ALOGW("CameraService::connect X (pid %d, \"%s\") rejected"
+        	" (camera %d is still busy).", callingPid,
+        	clientName8.string(), cameraId);
+		return false;
+	}
     return true;
 }
 
@@ -673,6 +696,7 @@ status_t CameraService::connectHelperLocked(
 
     int facing = -1;
     int deviceVersion = getDeviceVersion(cameraId, &facing);
+	String8 clientName8(clientPackageName);
 
     if (halVersion < 0 || halVersion == deviceVersion) {
         // Default path: HAL version is unspecified by caller, create CameraClient
@@ -724,8 +748,14 @@ status_t CameraService::connectHelperLocked(
     }
 
     mClient[cameraId] = client;
-    LOG1("CameraService::connect X (id %d, this pid is %d)", cameraId,
-         getpid());
+    ALOGW("CameraService::connect X (id %d, this pid is %d, name %s)", cameraId,
+         getpid(), clientName8.string());
+	
+	if(!strcmp("com.android.systemui", clientName8.string())){
+		mSystemUiFlashConnected = true;
+	}else {
+		mSystemUiFlashConnected = false;
+	}
 
     return OK;
 }
@@ -1141,8 +1171,9 @@ status_t CameraService::supportsCameraApi(int cameraId, int apiVersion) {
     return OK;
 }
 
-void CameraService::removeClientByRemote(const wp<IBinder>& remoteBinder) {
+void CameraService::removeClientByRemote(const wp<IBinder>& remoteBinder, const String16 clientPackageName) {
     int callingPid = getCallingPid();
+	String8 clientName8(clientPackageName);
     LOG1("CameraService::removeClientByRemote E (pid %d)", callingPid);
 
     // Declare this before the lock to make absolutely sure the
@@ -1154,8 +1185,10 @@ void CameraService::removeClientByRemote(const wp<IBinder>& remoteBinder) {
 
     if (client != 0) {
         // Found our camera, clear and leave.
-        LOG1("removeClient: clear camera %d", outIndex);
-
+        ALOGW("removeClient: clear camera %d, package name %s", outIndex, clientName8.string());
+		if(!strcmp("com.android.systemui", clientName8.string())) {
+			mSystemUiFlashConnected = false;
+		}
         sp<IBinder> remote = client->getRemote();
         if (remote != NULL) {
             remote->unlinkToDeath(this);
@@ -1304,8 +1337,10 @@ void CameraService::setCameraBusy(int cameraId) {
 
 void CameraService::setCameraFree(int cameraId) {
     android_atomic_write(0, &mBusy[cameraId]);
-
-    ALOGV("setCameraFree cameraId=%d", cameraId);
+	if(cameraId == 0 ) {
+		sendSignal();
+	}
+    ALOGV("setCameraFree cameraId=%d end", cameraId);
 }
 
 // We share the media players for shutter and recording sound for all clients.
@@ -1354,6 +1389,18 @@ void CameraService::playSound(sound_kind kind) {
         player->seekTo(0);
         player->start();
     }
+}
+
+void CameraService::sendSignal() {
+	ALOGV("sendSignal in");
+	bool lock = false;
+	lock = mFlashLock.tryLock();
+	if(lock) {
+		ALOGV("sendSignal:: lock already. signal to.");
+		mFlashCondition.signal();
+	}else {
+		mFlashLock.unlock();
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -1417,11 +1464,19 @@ CameraService::BasicClient::~BasicClient() {
 
 void CameraService::BasicClient::disconnect() {
     ALOGV("BasicClient::disconnect");
-    mCameraService->removeClientByRemote(mRemoteBinder);
+    mCameraService->removeClientByRemote(mRemoteBinder, mClientPackageName);
 
     finishCameraOps();
     // client shouldn't be able to call into us anymore
     mClientPid = 0;
+}
+
+status_t CameraService::BasicClient::dump(int, const Vector<String16>&) {
+    // No dumping of clients directly over Binder,
+    // must go through CameraService::dump
+    android_errorWriteWithInfoLog(SN_EVENT_LOG_ID, "26265403",
+            IPCThreadState::self()->getCallingUid(), NULL, 0);
+    return OK;
 }
 
 status_t CameraService::BasicClient::startCameraOps() {
@@ -1438,13 +1493,13 @@ status_t CameraService::BasicClient::startCameraOps() {
             mClientPackageName, mOpsCallback);
     res = mAppOpsManager.startOp(AppOpsManager::OP_CAMERA,
             mClientUid, mClientPackageName);
-
+	#if 0 //commented by zyl
     if (res != AppOpsManager::MODE_ALLOWED) {
         ALOGI("Camera %d: Access for \"%s\" has been revoked",
                 mCameraId, String8(mClientPackageName).string());
         return PERMISSION_DENIED;
     }
-
+	#endif
     mOpsActive = true;
 
     // Transition device availability listeners from PRESENT -> NOT_AVAILABLE
@@ -1692,7 +1747,7 @@ status_t CameraService::dump(int fd, const Vector<String16>& args) {
             hasClient = true;
             result = String8::format("  Device is open. Client instance dump:\n");
             write(fd, result.string(), result.size());
-            client->dump(fd, args);
+            client->dumpClient(fd, args);
         }
         if (!hasClient) {
             result = String8::format("\nNo active camera clients yet.\n");

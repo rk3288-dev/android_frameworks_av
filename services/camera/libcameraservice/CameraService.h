@@ -38,7 +38,7 @@
 #include <camera/ICameraServiceListener.h>
 
 /* This needs to be increased if we can have more cameras */
-#define MAX_CAMERAS 2
+#define MAX_CAMERAS 3
 
 namespace android {
 
@@ -57,6 +57,9 @@ class CameraService :
 public:
     class Client;
     class BasicClient;
+
+    // Event log ID
+    static const int SN_EVENT_LOG_ID = 0x534e4554;
 
     // Implementation of BinderService<T>
     static char const* getServiceName() { return "media.camera"; }
@@ -122,7 +125,7 @@ public:
 
     /////////////////////////////////////////////////////////////////////
     // Client functionality
-    virtual void        removeClientByRemote(const wp<IBinder>& remoteBinder);
+    virtual void        removeClientByRemote(const wp<IBinder>& remoteBinder, const String16 clientPackageName);
 
     enum sound_kind {
         SOUND_SHUTTER = 0,
@@ -133,6 +136,7 @@ public:
     void                loadSound();
     void                playSound(sound_kind kind);
     void                releaseSound();
+	void 				sendSignal();
 
     /////////////////////////////////////////////////////////////////////
     // CameraDeviceFactory functionality
@@ -165,7 +169,10 @@ public:
             return mRemoteBinder;
         }
 
-        virtual status_t    dump(int fd, const Vector<String16>& args) = 0;
+        // Disallows dumping over binder interface
+        virtual status_t      dump(int fd, const Vector<String16>& args);
+        // Internal dump method to be called by CameraService
+        virtual status_t      dumpClient(int fd, const Vector<String16>& args) = 0;
 
     protected:
         BasicClient(const sp<CameraService>& cameraService,
@@ -360,6 +367,8 @@ private:
     virtual sp<BasicClient>  getClientByRemote(const wp<IBinder>& cameraClient);
 
     Mutex               mServiceLock;
+	Mutex				mFlashLock;
+	Condition			mFlashCondition;
     // either a Client or CameraDeviceClient
     wp<BasicClient>     mClient[MAX_CAMERAS];  // protected by mServiceLock
     Mutex               mClientLock[MAX_CAMERAS]; // prevent Client destruction inside callbacks

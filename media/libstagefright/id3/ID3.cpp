@@ -25,6 +25,7 @@
 #include <media/stagefright/Utils.h>
 #include <utils/String8.h>
 #include <byteswap.h>
+//#define ADD_RKUTF8
 
 namespace android {
 
@@ -194,6 +195,13 @@ struct id3_header {
 
     if (header.version_major == 4) {
         void *copy = malloc(size);
+        if (copy == NULL) {
+            free(mData);
+            mData = NULL;
+            ALOGE("b/24623447, no more memory");
+            return false;
+        }
+
         memcpy(copy, mData, size);
 
         bool success = removeUnsynchronizationV2_4(false /* iTunesHack */);
@@ -234,7 +242,14 @@ struct id3_header {
             return false;
         }
 
-        size_t extendedHeaderSize = U32_AT(&mData[0]) + 4;
+        size_t extendedHeaderSize = U32_AT(&mData[0]);
+        if (extendedHeaderSize > SIZE_MAX - 4) {
+            free(mData);
+            mData = NULL;
+            ALOGE("b/24623447, extendedHeaderSize is too large");
+            return false;
+        }
+        extendedHeaderSize += 4;
 
         if (extendedHeaderSize > mSize) {
             free(mData);
@@ -252,7 +267,10 @@ struct id3_header {
             if (extendedHeaderSize >= 10) {
                 size_t paddingSize = U32_AT(&mData[6]);
 
-                if (mFirstFrameOffset + paddingSize > mSize) {
+                if (paddingSize > SIZE_MAX - mFirstFrameOffset) {
+                    ALOGE("b/24623447, paddingSize is too large");
+                }
+                if (paddingSize > mSize - mFirstFrameOffset) {
                     free(mData);
                     mData = NULL;
 
@@ -327,7 +345,7 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
     size_t oldSize = mSize;
 
     size_t offset = 0;
-    while (offset + 10 <= mSize) {
+    while (mSize >= 10 && offset <= mSize - 10) {
         if (!memcmp(&mData[offset], "\0\0\0\0", 4)) {
             break;
         }
@@ -339,7 +357,7 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
             return false;
         }
 
-        if (offset + dataSize + 10 > mSize) {
+        if (dataSize > mSize - 10 - offset) {
             return false;
         }
 
@@ -349,6 +367,9 @@ bool ID3::removeUnsynchronizationV2_4(bool iTunesHack) {
         if (flags & 1) {
             // Strip data length indicator
 
+            if (mSize < 14 || mSize - 14 < offset || dataSize < 4) {
+                return false;
+            }
             memmove(&mData[offset + 10], &mData[offset + 14], mSize - offset - 14);
             mSize -= 4;
             dataSize -= 4;
@@ -468,6 +489,49 @@ void ID3::Iterator::getID(String8 *id) const {
     }
 }
 
+static void convertISO8859ToString8(
+        const uint8_t *data, size_t size,
+        String8 *s) {
+    size_t utf8len = 0;
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] == '\0') {
+            size = i;
+            break;
+        } else if (data[i] < 0x80) {
+            ++utf8len;
+        } else {
+            utf8len += 2;
+        }
+    }
+
+    if (utf8len == size) {
+        // Only ASCII characters present.
+
+        s->setTo((const char *)data, size);
+        return;
+    }
+
+    char *tmp = new char[utf8len];
+    char *ptr = tmp;
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] == '\0') {
+            break;
+        } else if (data[i] < 0x80) {
+            *ptr++ = data[i];
+        } else if (data[i] < 0xc0) {
+            *ptr++ = 0xc2;
+            *ptr++ = data[i];
+        } else {
+            *ptr++ = 0xc3;
+            *ptr++ = data[i] - 64;
+        }
+    }
+
+    s->setTo(tmp, utf8len);
+
+    delete[] tmp;
+    tmp = NULL;
+}
 
 // the 2nd argument is used to get the data following the \0 in a comment field
 void ID3::Iterator::getString(String8 *id, String8 *comment) const {
@@ -506,6 +570,9 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         return;
     }
 
+    if (mFrameSize < getHeaderLength() + 1) {
+        return;
+    }
     size_t n = mFrameSize - getHeaderLength() - 1;
     if (otherdata) {
         // skip past the encoding, language, and the 0 separator
@@ -519,72 +586,131 @@ void ID3::Iterator::getstring(String8 *id, bool otherdata) const {
         n -= skipped;
     }
 
+//    if(n < 0)
+//		n = 0;
+
     if (encoding == 0x00) {
         // supposedly ISO 8859-1
         id->setTo((const char*)frameData + 1, n);
     } else if (encoding == 0x03) {
-        // supposedly UTF-8
-        id->setTo((const char *)(frameData + 1), n);
-    } else if (encoding == 0x02) {
-        // supposedly UTF-16 BE, no byte order mark.
-        // API wants number of characters, not number of bytes...
-        int len = n / 2;
-        const char16_t *framedata = (const char16_t *) (frameData + 1);
-        char16_t *framedatacopy = NULL;
-#if BYTE_ORDER == LITTLE_ENDIAN
-        framedatacopy = new char16_t[len];
-        for (int i = 0; i < len; i++) {
-            framedatacopy[i] = bswap_16(framedata[i]);
-        }
-        framedata = framedatacopy;
+        // UTF-8
+#ifdef ADD_RKUTF8
+		String8 value("rkutf8");
+		value.append((const char *)(frameData + 1), n);
+		id->setTo(value.string(),n+6);
+#else
+		id->setTo((const char *)(frameData + 1), n);
 #endif
-        id->setTo(framedata, len);
+	} else if (encoding == 0x02) {
+		// UTF-16 BE, no byte order mark.
+		// API wants number of characters, not number of bytes...
+		int len = n / 2;
+#ifdef ADD_RKUTF8
+		int rklen = len + 6;//need add rkutf8 tag
+		char16_t *rkframedata = new char16_t[rklen];
+#endif
+		const char16_t *framedata = (const char16_t *) (frameData + 1);
+		char16_t *framedatacopy = NULL;
+#if BYTE_ORDER == LITTLE_ENDIAN
+		framedatacopy = new char16_t[len];
+		for (int i = 0; i < len; i++) {
+			framedatacopy[i] = bswap_16(framedata[i]);
+		}
+		framedata = framedatacopy;
+#endif
+#ifdef ADD_RKUTF8
+		rkframedata[0]='r';
+		rkframedata[1]='k';
+		rkframedata[2]='u';
+		rkframedata[3]='t';
+		rkframedata[4]='f';
+		rkframedata[5]='8';
+		memcpy(rkframedata+6,framedata, len*sizeof(char16_t));
+		id->setTo(rkframedata, rklen);
+		if (framedatacopy != NULL) {
+			delete[] framedatacopy;
+		}
+		if(rkframedata)
+			delete[]rkframedata;
+#else
+		id->setTo(framedata, len);
+		if (framedatacopy != NULL) {
+			delete[] framedatacopy;
+		}
+#endif
+	} else if (encoding == 0x01) {
+		// UCS-2
+		// API wants number of characters, not number of bytes...
+		int len = n / 2;
+		const char16_t *framedata = (const char16_t *) (frameData + 1);
+		char16_t *framedatacopy = NULL;
+		bool isUCS2 = false;
+		if (*framedata == 0xfffe) {
+			isUCS2 = true;
+			// endianness marker doesn't match host endianness, convert
+			framedatacopy = new char16_t[len];
+			for (int i = 0; i < len; i++) {
+				framedatacopy[i] = bswap_16(framedata[i]);
+			}
+			framedata = framedatacopy;
+		}
+		// If the string starts with an endianness marker, skip it
+		if (*framedata == 0xfeff) {
+			isUCS2 = true;
+			framedata++;
+			len--;
+		}
+#ifdef ADD_RKUTF8
+		char16_t *rkframedata = NULL;
+		if(isUCS2){
+			int rklen = len + 6;//need add rkutf8 tag
+			rkframedata = new char16_t[rklen];
+			int index = 0;
+			if(framedata == framedatacopy)
+			{
+				index = 1;
+				rkframedata[0] = 0xfffe;
+			}
+			rkframedata[index+0]='r';
+			rkframedata[index+1]='k';
+			rkframedata[index+2]='u';
+			rkframedata[index+3]='t';
+			rkframedata[index+4]='f';
+			rkframedata[index+5]='8';
+			memcpy(rkframedata+6+index,framedata+index, (len-index)*sizeof(char16_t));
+			id->setTo(rkframedata, rklen);
+		}else//if not is UCS-2, fixed it ISO8859
+			convertISO8859ToString8(frameData + 1, n, id);
+		if(rkframedata != NULL){
+			delete[] rkframedata;
+		}
+#else
+
+		// check if the resulting data consists entirely of 8-bit values
+		bool eightBit = true;
+		for (int i = 0; i < len; i++) {
+			if (framedata[i] > 0xff) {
+				eightBit = false;
+				break;
+			}
+		}
+		if (eightBit) {
+			// collapse to 8 bit, then let the media scanner client figure out the real encoding
+			char *frame8 = new char[len];
+			for (int i = 0; i < len; i++) {
+				frame8[i] = framedata[i];
+			}
+			id->setTo(frame8, len);
+			delete [] frame8;
+		} else {
+			id->setTo(framedata, len);
+		}
+#endif
+
         if (framedatacopy != NULL) {
             delete[] framedatacopy;
         }
-    } else if (encoding == 0x01) {
-        // UCS-2
-        // API wants number of characters, not number of bytes...
-        int len = n / 2;
-        const char16_t *framedata = (const char16_t *) (frameData + 1);
-        char16_t *framedatacopy = NULL;
-        if (*framedata == 0xfffe) {
-            // endianness marker doesn't match host endianness, convert
-            framedatacopy = new char16_t[len];
-            for (int i = 0; i < len; i++) {
-                framedatacopy[i] = bswap_16(framedata[i]);
-            }
-            framedata = framedatacopy;
-        }
-        // If the string starts with an endianness marker, skip it
-        if (*framedata == 0xfeff) {
-            framedata++;
-            len--;
-        }
-
-        // check if the resulting data consists entirely of 8-bit values
-        bool eightBit = true;
-        for (int i = 0; i < len; i++) {
-            if (framedata[i] > 0xff) {
-                eightBit = false;
-                break;
-            }
-        }
-        if (eightBit) {
-            // collapse to 8 bit, then let the media scanner client figure out the real encoding
-            char *frame8 = new char[len];
-            for (int i = 0; i < len; i++) {
-                frame8[i] = framedata[i];
-            }
-            id->setTo(frame8, len);
-            delete [] frame8;
-        } else {
-            id->setTo(framedata, len);
-        }
-
-        if (framedatacopy != NULL) {
-            delete[] framedatacopy;
-        }
+        
     }
 }
 
@@ -632,6 +758,11 @@ void ID3::Iterator::findFrame() {
 
             mFrameSize += 6;
 
+            // Prevent integer overflow in validation
+            if (SIZE_MAX - mOffset <= mFrameSize) {
+                return;
+            }
+
             if (mOffset + mFrameSize > mParent.mSize) {
                 ALOGV("partial frame at offset %zu (size = %zu, bytes-remaining = %zu)",
                     mOffset, mFrameSize, mParent.mSize - mOffset - (size_t)6);
@@ -661,7 +792,7 @@ void ID3::Iterator::findFrame() {
                 return;
             }
 
-            size_t baseSize;
+            size_t baseSize = 0;
             if (mParent.mVersion == ID3_V2_4) {
                 if (!ParseSyncsafeInteger(
                             &mParent.mData[mOffset + 4], &baseSize)) {
@@ -671,7 +802,21 @@ void ID3::Iterator::findFrame() {
                 baseSize = U32_AT(&mParent.mData[mOffset + 4]);
             }
 
-            mFrameSize = 10 + baseSize;
+            /*if (baseSize == 0) {
+                return;
+            }*/
+
+            // Prevent integer overflow when adding
+            if (SIZE_MAX - 10 <= baseSize) {
+                return;
+            }
+
+            mFrameSize = 10 + baseSize; // add tag id, size field and flags
+
+            // Prevent integer overflow in validation
+            if (SIZE_MAX - mOffset <= mFrameSize) {
+                return;
+            }
 
             if (mOffset + mFrameSize > mParent.mSize) {
                 ALOGV("partial frame at offset %zu (size = %zu, bytes-remaining = %zu)",
@@ -803,6 +948,13 @@ ID3::getAlbumArt(size_t *length, String8 *mime) const {
 #endif
 
             size_t descLen = StringSize(&data[2 + mimeLen], encoding);
+
+            if (size < 2 ||
+                    size - 2 < mimeLen ||
+                    size - 2 - mimeLen < descLen) {
+                ALOGW("bogus album art sizes");
+                return NULL;
+            }
 
             *length = size - 2 - mimeLen - descLen;
 

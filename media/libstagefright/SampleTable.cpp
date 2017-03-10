@@ -27,6 +27,11 @@
 #include <media/stagefright/DataSource.h>
 #include <media/stagefright/Utils.h>
 
+/* TODO: remove after being merged into other branches */
+#ifndef UINT32_MAX
+#define UINT32_MAX       (4294967295U)
+#endif
+
 namespace android {
 
 // static
@@ -119,13 +124,18 @@ SampleTable::SampleTable(const sp<DataSource> &source)
       mTimeToSampleCount(0),
       mTimeToSample(NULL),
       mSampleTimeEntries(NULL),
-      mCompositionTimeDeltaEntries(NULL),
-      mNumCompositionTimeDeltaEntries(0),
+      //mCompositionTimeDeltaEntries(NULL),
+      //mNumCompositionTimeDeltaEntries(0),
+	  mComposTimeOffsetCount(0),
+      mComposTimeOffset(NULL),
       mCompositionDeltaLookup(new CompositionDeltaLookup),
       mSyncSampleOffset(-1),
       mNumSyncSamples(0),
       mSyncSamples(NULL),
       mLastSyncSampleIndex(0),
+      mSampleTableIndex(NULL),
+      mIndexEntry(0),
+      mSamplesize(0),
       mSampleToChunkEntries(NULL) {
     mSampleIterator = new SampleIterator(this);
 }
@@ -136,18 +146,24 @@ SampleTable::~SampleTable() {
 
     delete[] mSyncSamples;
     mSyncSamples = NULL;
+    if(mSampleTableIndex){
+        delete[] mSampleTableIndex;
+        mSampleTableIndex = NULL;
+    }
 
     delete mCompositionDeltaLookup;
     mCompositionDeltaLookup = NULL;
 
-    delete[] mCompositionTimeDeltaEntries;
-    mCompositionTimeDeltaEntries = NULL;
+   // delete[] mCompositionTimeDeltaEntries;
+    //mCompositionTimeDeltaEntries = NULL;
 
     delete[] mSampleTimeEntries;
     mSampleTimeEntries = NULL;
 
     delete[] mTimeToSample;
     mTimeToSample = NULL;
+    delete[] mComposTimeOffset;
+    mComposTimeOffset = NULL;
 
     delete mSampleIterator;
     mSampleIterator = NULL;
@@ -200,6 +216,68 @@ status_t SampleTable::setChunkOffsetParams(
 
     return OK;
 }
+status_t SampleTable::mov_build_index(){
+    unsigned chunk_samples, total = 0;
+    unsigned int stsc_index = 0;
+    unsigned samples_per_frame = 1;
+    unsigned int enty_index = 0;
+    int64_t current_offset;
+    int64_t current_dts = 0;
+    for(int i = 0;i < mNumSampleToChunkOffsets; i++){
+        unsigned count, chunk_count;
+        chunk_samples = mSampleToChunkEntries[i].samplesPerChunk;
+        if (i != mNumSampleToChunkOffsets - 1 && samples_per_frame &&chunk_samples%samples_per_frame) {
+            ALOGE("error unaligned chunk\n");
+            return OK;
+        }
+        if (samples_per_frame >= 160) { // gsm
+            count = chunk_samples / samples_per_frame;
+        } else if (samples_per_frame > 1) {
+            unsigned samples = (1024/samples_per_frame)*samples_per_frame;
+            count = (chunk_samples+samples-1) / samples;
+        } else {
+            count = (chunk_samples+1023) / 1024;
+        }
+        if (i < mNumSampleToChunkOffsets - 1)
+            chunk_count = mSampleToChunkEntries[i+1].startChunk- mSampleToChunkEntries[i].startChunk;
+        else
+            chunk_count = mNumChunkOffsets - (mSampleToChunkEntries[i].startChunk - 1);
+        total += chunk_count * count;
+    }
+    mSampleTableIndex = new AVIndexEntry[total];
+    mIndexEntry = total;
+    for (int i = 0; i < mNumChunkOffsets; i++) {
+        if(mSampleIterator->getChunkOffset(i,&current_offset)){
+            ALOGE("get chunk offset may be wrong");
+            return OK;
+        }
+        if (stsc_index + 1 < mNumSampleToChunkOffsets &&
+        i + 1 == mSampleToChunkEntries[stsc_index + 1].startChunk)
+            stsc_index++;
+        chunk_samples = mSampleToChunkEntries[stsc_index].samplesPerChunk;
+        while (chunk_samples > 0) {
+            unsigned size, samples;
+            if (samples_per_frame >= 160) { // gsm
+                samples = samples_per_frame;
+            } else {
+                samples = 1024 > chunk_samples?chunk_samples:1024;
+                size = samples*mSamplesize;//(sample_size)
+            }
+            if (enty_index >= total) {
+                ALOGE("wrong chunk count %d\n", total);
+                return OK;
+            }
+            mSampleTableIndex[enty_index].pos = current_offset;
+            mSampleTableIndex[enty_index].timestamp = current_dts;
+            mSampleTableIndex[enty_index].size = size;
+            current_offset += size;
+            current_dts += samples;
+            chunk_samples -= samples;
+            enty_index++;
+        }
+    }
+    return OK;
+}
 
 status_t SampleTable::setSampleToChunkParams(
         off64_t data_offset, size_t data_size) {
@@ -230,8 +308,13 @@ status_t SampleTable::setSampleToChunkParams(
         return ERROR_MALFORMED;
     }
 
+    if (SIZE_MAX / sizeof(SampleToChunkEntry) <= mNumSampleToChunkOffsets)
+        return ERROR_OUT_OF_RANGE;
+
     mSampleToChunkEntries =
-        new SampleToChunkEntry[mNumSampleToChunkOffsets];
+        new (std::nothrow) SampleToChunkEntry[mNumSampleToChunkOffsets];
+    if (!mSampleToChunkEntries)
+        return ERROR_OUT_OF_RANGE;
 
     for (uint32_t i = 0; i < mNumSampleToChunkOffsets; ++i) {
         uint8_t buffer[12];
@@ -279,6 +362,9 @@ status_t SampleTable::setSampleSizeParams(
 
     mDefaultSampleSize = U32_AT(&header[4]);
     mNumSampleSizes = U32_AT(&header[8]);
+    if (mNumSampleSizes > (UINT32_MAX - 12) / 16) {
+        return ERROR_MALFORMED;
+    }
 
     if (type == kSampleSizeType32) {
         mSampleSizeFieldSize = 32;
@@ -330,11 +416,16 @@ status_t SampleTable::setTimeToSampleParams(
     }
 
     mTimeToSampleCount = U32_AT(&header[4]);
-    uint64_t allocSize = mTimeToSampleCount * 2 * sizeof(uint32_t);
+    
+    uint64_t allocSize = (uint64_t)mTimeToSampleCount * 2 * sizeof(uint32_t);
+    
     if (allocSize > SIZE_MAX) {
         return ERROR_OUT_OF_RANGE;
     }
-    mTimeToSample = new uint32_t[mTimeToSampleCount * 2];
+
+    mTimeToSample = new (std::nothrow) uint32_t[mTimeToSampleCount * 2];
+    if (!mTimeToSample)
+        return ERROR_OUT_OF_RANGE;
 
     size_t size = sizeof(uint32_t) * mTimeToSampleCount * 2;
     if (mDataSource->readAt(
@@ -348,7 +439,7 @@ status_t SampleTable::setTimeToSampleParams(
 
     return OK;
 }
-
+#if 0
 status_t SampleTable::setCompositionTimeToSampleParams(
         off64_t data_offset, size_t data_size) {
     ALOGI("There are reordered frames present.");
@@ -376,12 +467,14 @@ status_t SampleTable::setCompositionTimeToSampleParams(
     }
 
     mNumCompositionTimeDeltaEntries = numEntries;
-    uint64_t allocSize = numEntries * 2 * sizeof(uint32_t);
+    uint64_t allocSize = numEntries * 2 * (uint64_t)sizeof(uint32_t);
     if (allocSize > SIZE_MAX) {
         return ERROR_OUT_OF_RANGE;
     }
 
-    mCompositionTimeDeltaEntries = new uint32_t[2 * numEntries];
+    mCompositionTimeDeltaEntries = new (std::nothrow) uint32_t[2 * numEntries];
+    if (!mCompositionTimeDeltaEntries)
+        return ERROR_OUT_OF_RANGE;
 
     if (mDataSource->readAt(
                 data_offset + 8, mCompositionTimeDeltaEntries, numEntries * 8)
@@ -399,6 +492,37 @@ status_t SampleTable::setCompositionTimeToSampleParams(
     mCompositionDeltaLookup->setEntries(
             mCompositionTimeDeltaEntries, mNumCompositionTimeDeltaEntries);
 
+    return OK;
+}
+#endif
+status_t SampleTable::setComposTimeOffParams(
+        off64_t data_offset, size_t data_size) {
+    if (mComposTimeOffset != NULL || data_size < 8) {
+        return ERROR_MALFORMED;
+    }
+    uint8_t header[8];
+    if (mDataSource->readAt(
+                data_offset, header, sizeof(header)) < (ssize_t)sizeof(header)) {
+        return ERROR_IO;
+    }
+    if (U32_AT(header) != 0) {
+        return ERROR_MALFORMED;
+    }
+    mComposTimeOffsetCount = U32_AT(&header[4]);
+    
+    mComposTimeOffset = new (std::nothrow)uint32_t[mComposTimeOffsetCount * 2];
+
+    if(!mComposTimeOffset) 
+        return ERROR_OUT_OF_RANGE;
+
+    uint64_t size = (uint64_t) mComposTimeOffsetCount * 2*sizeof(uint32_t);
+    if (mDataSource->readAt(
+                data_offset + 8, mComposTimeOffset, size) < (ssize_t)size) {
+        return ERROR_IO;
+    }
+    for (uint32_t i = 0; i < mComposTimeOffsetCount * 2; ++i) {
+        mComposTimeOffset[i] = ntohl(mComposTimeOffset[i]);
+    }
     return OK;
 }
 
@@ -426,12 +550,15 @@ status_t SampleTable::setSyncSampleParams(off64_t data_offset, size_t data_size)
         ALOGV("Table of sync samples is empty or has only a single entry!");
     }
 
-    uint64_t allocSize = mNumSyncSamples * sizeof(uint32_t);
+    uint64_t allocSize = mNumSyncSamples * (uint64_t)sizeof(uint32_t);
     if (allocSize > SIZE_MAX) {
         return ERROR_OUT_OF_RANGE;
     }
 
-    mSyncSamples = new uint32_t[mNumSyncSamples];
+    mSyncSamples = new (std::nothrow) uint32_t[mNumSyncSamples];
+    if (!mSyncSamples)
+        return ERROR_OUT_OF_RANGE;
+
     size_t size = mNumSyncSamples * sizeof(uint32_t);
     if (mDataSource->readAt(mSyncSampleOffset + 8, mSyncSamples, size)
             != (ssize_t)size) {
@@ -495,14 +622,16 @@ int SampleTable::CompareIncreasingTime(const void *_a, const void *_b) {
 void SampleTable::buildSampleEntriesTable() {
     Mutex::Autolock autoLock(mLock);
 
-    if (mSampleTimeEntries != NULL) {
+    if (mSampleTimeEntries != NULL || mNumSampleSizes == 0) {
         return;
     }
 
-    mSampleTimeEntries = new SampleTimeEntry[mNumSampleSizes];
+    mSampleTimeEntries = new (std::nothrow) SampleTimeEntry[mNumSampleSizes];
+    if (!mSampleTimeEntries)
+        return;
 
     uint32_t sampleIndex = 0;
-    uint32_t sampleTime = 0;
+    int64_t sampleTime = 0;
 
     for (uint32_t i = 0; i < mTimeToSampleCount; ++i) {
         uint32_t n = mTimeToSample[2 * i];
@@ -537,6 +666,10 @@ status_t SampleTable::findSampleAtTime(
         uint64_t req_time, uint64_t scale_num, uint64_t scale_den,
         uint32_t *sample_index, uint32_t flags) {
     buildSampleEntriesTable();
+
+    if (mSampleTimeEntries == NULL) {
+        return ERROR_OUT_OF_RANGE;
+    }
 
     uint32_t left = 0;
     uint32_t right_plus_one = mNumSampleSizes;
@@ -619,7 +752,11 @@ status_t SampleTable::findSyncSampleNear(
         *sample_index = 0;
         return OK;
     }
-
+    if(!start_sample_index)
+    {
+         *sample_index = 0;
+         return OK;
+    }
     uint32_t left = 0;
     uint32_t right_plus_one = mNumSyncSamples;
     while (left < right_plus_one) {
@@ -703,6 +840,17 @@ status_t SampleTable::findSyncSampleNear(
     return OK;
 }
 
+status_t SampleTable::findSampleFromIndex(
+        int64_t req_time, uint32_t *sample_index, uint32_t flags) {
+     for(int i = 0;i < mIndexEntry; i++){
+         if(req_time < mSampleTableIndex[i].timestamp){
+            *sample_index = i;
+            return OK;
+         }
+     }
+     *sample_index = mIndexEntry - 1;
+     return OK;
+}
 status_t SampleTable::findThumbnailSample(uint32_t *sample_index) {
     Mutex::Autolock autoLock(mLock);
 
@@ -756,7 +904,7 @@ status_t SampleTable::getMetaDataForSample(
         uint32_t sampleIndex,
         off64_t *offset,
         size_t *size,
-        uint32_t *compositionTime,
+        int64_t *compositionTime,
         bool *isSyncSample,
         uint32_t *sampleDuration) {
     Mutex::Autolock autoLock(mLock);
@@ -806,10 +954,29 @@ status_t SampleTable::getMetaDataForSample(
 
     return OK;
 }
-
+status_t SampleTable::getMetaDataFromIndex(
+        uint32_t sampleIndex,
+        off64_t *offset,
+        size_t *size,
+        int64_t *compositionTime,
+        bool *isSyncSample) {
+    Mutex::Autolock autoLock(mLock);
+    *isSyncSample = false;
+    if(sampleIndex >= mIndexEntry){
+        ALOGE("the sampleIndex num is wrong");
+        return ERROR_END_OF_STREAM;
+    }
+    *offset = mSampleTableIndex[sampleIndex].pos;
+    *size = mSampleTableIndex[sampleIndex].size;
+    *compositionTime = mSampleTableIndex[sampleIndex].timestamp;
+    return OK;
+}
+#if 0
 uint32_t SampleTable::getCompositionTimeOffset(uint32_t sampleIndex) {
     return mCompositionDeltaLookup->getCompositionTimeOffset(sampleIndex);
 }
+#endif
+
 
 }  // namespace android
 

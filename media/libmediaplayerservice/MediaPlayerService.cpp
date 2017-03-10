@@ -1569,7 +1569,7 @@ status_t MediaPlayerService::AudioOutput::open(
         bufferCount = mMinBufferCount;
 
     }
-    ALOGV("open(%u, %d, 0x%x, 0x%x, %d, %d 0x%x)", sampleRate, channelCount, channelMask,
+    ALOGD("open(%u, %d, 0x%x, 0x%x, %d, %d 0x%x)", sampleRate, channelCount, channelMask,
                 format, bufferCount, mSessionId, flags);
     uint32_t afSampleRate;
     size_t afFrameCount;
@@ -1596,6 +1596,11 @@ status_t MediaPlayerService::AudioOutput::open(
         }
 
         frameCount = (sampleRate*afFrameCount*bufferCount)/afSampleRate;
+	if(AUDIO_OUTPUT_FLAG_DIRECT == flags) {
+	    afSampleRate = sampleRate;
+	    frameCount = afFrameCount*bufferCount;
+            ALOGI("AUDIO_OUTPUT_FLAG_DIRECT, AFSR %d, FC %d\n", afSampleRate, frameCount);
+        }
     }
 
     if (channelMask == CHANNEL_MASK_USE_CHANNEL_ORDER) {
@@ -1657,8 +1662,6 @@ status_t MediaPlayerService::AudioOutput::open(
     // the new track in advance so that we can read additional stream info
 
     if (!(reuse && bothOffloaded)) {
-        ALOGV("creating new AudioTrack");
-
         if (mCallback != NULL) {
             newcbd = new CallbackData(this);
             t = new AudioTrack(
@@ -2078,7 +2081,13 @@ status_t MediaPlayerService::AudioCache::open(
     mMsecsPerFrame = 1.e3 / (float) sampleRate;
     mFrameSize =  audio_is_linear_pcm(mFormat)
             ? mChannelCount * audio_bytes_per_sample(mFormat) : 1;
-    mFrameCount = mHeap->getSize() / mFrameSize;
+    ALOGV("==========mFrameCount:%d,mHeap->getSize():%d,mHeap->getSize() / mFrameSize:%d====",
+        mFrameCount,mHeap->getSize(),mHeap->getSize() / mFrameSize);
+    if (cb == NULL) {
+        //use default buffersize for awesomeplayer and Use the size of the heap if AudioCache used by NuPlayer.
+        mFrameCount = mHeap->getSize() / mFrameSize;
+
+    }
 
     if (cb != NULL) {
         mCallbackThread = new CallbackThread(this, cb, cookie);

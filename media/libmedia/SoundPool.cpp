@@ -20,7 +20,7 @@
 #include <inttypes.h>
 
 #include <utils/Log.h>
-
+#include <cutils/properties.h>
 #define USE_SHARED_MEM_BUFFER
 
 #include <media/AudioTrack.h>
@@ -183,6 +183,17 @@ bool SoundPool::startThreads()
     return mDecodeThread != NULL;
 }
 
+sp<Sample> SoundPool::findSample(int sampleID)
+{
+    Mutex::Autolock lock(&mLock);
+    return findSample_l(sampleID);
+}
+
+sp<Sample> SoundPool::findSample_l(int sampleID)
+{
+    return mSamples.valueFor(sampleID);
+}
+
 SoundChannel* SoundPool::findChannel(int channelID)
 {
     for (int i = 0; i < mMaxChannels; ++i) {
@@ -206,29 +217,42 @@ SoundChannel* SoundPool::findNextChannel(int channelID)
 int SoundPool::load(const char* path, int priority __unused)
 {
     ALOGV("load: path=%s, priority=%d", path, priority);
-    Mutex::Autolock lock(&mLock);
-    sp<Sample> sample = new Sample(++mNextSampleID, path);
-    mSamples.add(sample->sampleID(), sample);
-    doLoad(sample);
-    return sample->sampleID();
+    int sampleID;
+    {
+        Mutex::Autolock lock(&mLock);
+        sampleID = ++mNextSampleID;
+        sp<Sample> sample = new Sample(sampleID, path);
+        mSamples.add(sampleID, sample);
+        sample->startLoad();
+    }
+    // mDecodeThread->loadSample() must be called outside of mLock.
+    // mDecodeThread->loadSample() may block on mDecodeThread message queue space;
+    // the message queue emptying may block on SoundPool::findSample().
+    //
+    // It theoretically possible that sample loads might decode out-of-order.
+    mDecodeThread->loadSample(sampleID);
+    return sampleID;
 }
 
 int SoundPool::load(int fd, int64_t offset, int64_t length, int priority __unused)
 {
     ALOGV("load: fd=%d, offset=%" PRId64 ", length=%" PRId64 ", priority=%d",
             fd, offset, length, priority);
-    Mutex::Autolock lock(&mLock);
-    sp<Sample> sample = new Sample(++mNextSampleID, fd, offset, length);
-    mSamples.add(sample->sampleID(), sample);
-    doLoad(sample);
-    return sample->sampleID();
-}
-
-void SoundPool::doLoad(sp<Sample>& sample)
-{
-    ALOGV("doLoad: loading sample sampleID=%d", sample->sampleID());
-    sample->startLoad();
-    mDecodeThread->loadSample(sample->sampleID());
+    int sampleID;
+    {
+        Mutex::Autolock lock(&mLock);
+        sampleID = ++mNextSampleID;
+        sp<Sample> sample = new Sample(sampleID, fd, offset, length);
+        mSamples.add(sampleID, sample);
+        sample->startLoad();
+    }
+    // mDecodeThread->loadSample() must be called outside of mLock.
+    // mDecodeThread->loadSample() may block on mDecodeThread message queue space;
+    // the message queue emptying may block on SoundPool::findSample().
+    //
+    // It theoretically possible that sample loads might decode out-of-order.
+    mDecodeThread->loadSample(sampleID);
+    return sampleID;
 }
 
 bool SoundPool::unload(int sampleID)
@@ -243,7 +267,6 @@ int SoundPool::play(int sampleID, float leftVolume, float rightVolume,
 {
     ALOGV("play sampleID=%d, leftVolume=%f, rightVolume=%f, priority=%d, loop=%d, rate=%f",
             sampleID, leftVolume, rightVolume, priority, loop, rate);
-    sp<Sample> sample;
     SoundChannel* channel;
     int channelID;
 
@@ -252,8 +275,15 @@ int SoundPool::play(int sampleID, float leftVolume, float rightVolume,
     if (mQuit) {
         return 0;
     }
+
+    char value[PROPERTY_VALUE_MAX] = "";
+    property_get("media.cfg.audio.bypass", value, "-1");
+    if (memcmp(value, "true", 4) == 0) {
+         //ALOGD("do not play soundeffect...");
+         return 0;
+    }
     // is sample ready?
-    sample = findSample(sampleID);
+    sp<Sample> sample(findSample_l(sampleID));
     if ((sample == 0) || (sample->state() != Sample::READY)) {
         ALOGW("  sample %d not READY", sampleID);
         return 0;
